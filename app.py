@@ -1,4 +1,4 @@
-import io  # <-- Import this
+import io
 import os
 import shutil
 import subprocess
@@ -7,7 +7,6 @@ import threading
 
 from flask import Flask, abort, request, send_file
 from flask_caching import Cache
-from werkzeug.exceptions import HTTPException
 
 # App and Cache Configuration
 config = {
@@ -27,11 +26,8 @@ FIREFOX_TIMEOUT = 15
 firefox_lock = threading.Lock()
 
 
-from flask import Response
-
-
 @app.route("/screenshot")
-def capture_screenshot() -> Response:
+def capture_screenshot():
     """
     Public-facing view.
     Fetches screenshot bytes (from cache or by generation)
@@ -48,42 +44,49 @@ def capture_screenshot() -> Response:
         )
 
     try:
-        # Call the cached function to get the raw image data
+        # Call the memoized function to get the raw image data
+        # The cache key will be based on the 'url' argument
         image_bytes = get_image_bytes(url)
 
         # Send the bytes from memory using io.BytesIO
         return send_file(io.BytesIO(image_bytes), mimetype="image/png")
-    except HTTPException as e:
-        # If get_image_bytes raised an abort (HTTPException), re-raise it
-        app.logger.warning(f"Handled error for {url}: {e.code} {e.description}")
-        return abort(e.code if e.code is not None else 500, description=e.description)
     except Exception as e:
+        # If get_image_bytes raised an abort (HTTPException), re-raise it
+        if hasattr(e, "code"):
+            app.logger.warning(f"Handled error for {url}: {e.code} {e.description}")
+            return abort(e.code, description=e.description)
+
         # Handle other unexpected errors
-        app.logger.error(f"Unexpected error in screenshot route for {url}: {e}")
+        app.logger.error(f"Unexpected error in screenshot route: {e}")
         return abort(500, description="Internal server error handling request.")
 
 
-@cache.cached(timeout=3600)  # Cache the result of *this* function
-def get_image_bytes(url: str) -> bytes:
+@cache.memoize(timeout=3600)  # <-- CORRECT DECORATOR
+def get_image_bytes(url):
     """
     Worker function.
     Generates the screenshot and returns the raw bytes.
-    The result of this function (the bytes) is cached.
+    The result of this function is memoized based on the 'url' argument.
     """
-    output_path: str | None = None
+    output_path = None
+    default_screenshot_file = os.path.join(os.getcwd(), "screenshot.png")
 
     try:
-        # 1. Create a unique destination path for Firefox to write to
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
-            output_path = temp_file.name
+        # 1. Create a unique destination path
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as temp:
+            output_path = temp.name
 
         # 2. Acquire lock
         with firefox_lock:
-            # 3. Construct command with direct output path
-            command = ["firefox", "--headless", "--screenshot", output_path, url]
+            # 3. Clean up old file
+            if os.path.exists(default_screenshot_file):
+                os.remove(default_screenshot_file)
 
-            # 4. Execute command
-            app.logger.info(f"CACHE MISS: Running Firefox for {url} to {output_path}")
+            # 4. Construct command
+            command = ["firefox", "--headless", "--screenshot", url]  # No filename
+
+            # 5. Execute command
+            app.logger.info(f"CACHE MISS: Running Firefox for {url}")
             result = subprocess.run(
                 command,
                 timeout=FIREFOX_TIMEOUT,
@@ -92,16 +95,23 @@ def get_image_bytes(url: str) -> bytes:
                 text=True,
             )
 
-            # 5. Check for file creation and size
-            if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            # 6. Check for file creation
+            if (
+                not os.path.exists(default_screenshot_file)
+                or os.path.getsize(default_screenshot_file) == 0
+            ):
                 app.logger.error(
-                    f"Firefox command ran but produced no file at {output_path}. Stderr: {result.stderr}"
+                    f"Firefox command ran but produced no file. Stderr: {result.stderr}"
                 )
+                # Raise an exception that the route can catch
                 raise abort(
                     500, description="Firefox ran but failed to produce a screenshot."
                 )
 
-        # 6. Read the file bytes into memory
+            # 7. Move file
+            shutil.move(default_screenshot_file, output_path)
+
+        # 8. Read the file bytes into memory
         with open(output_path, "rb") as f:
             image_bytes = f.read()
 
@@ -133,7 +143,13 @@ def get_image_bytes(url: str) -> bytes:
         raise abort(500, description="An unexpected server error occurred in worker.")
 
     finally:
-        # Clean up the temporary file if it was created
+        # 9. Clean up all files
+        if os.path.exists(default_screenshot_file):
+            try:
+                os.remove(default_screenshot_file)
+            except Exception as e:
+                app.logger.error(f"Failed to remove lingering default file: {e}")
+
         if output_path and os.path.exists(output_path):
             try:
                 os.remove(output_path)
